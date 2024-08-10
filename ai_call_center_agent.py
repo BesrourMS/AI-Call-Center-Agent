@@ -12,6 +12,8 @@ import logging
 from dotenv import load_dotenv
 from threading import Thread
 from queue import Queue
+import asyncio
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -33,80 +35,108 @@ class AICallCenterAgent:
         self.audio_queue = Queue()
         pygame.mixer.init()
         self.load_config()
+        self.session = None
 
     def load_config(self):
+        """ Load configuration settings. """
+        config_path = 'config.json'
+        if not os.path.isfile(config_path):
+            logger.warning("Config file not found. Using default settings.")
+            return
+
         try:
-            with open('config.json', 'r') as config_file:
+            with open(config_path, 'r') as config_file:
                 config = json.load(config_file)
                 self.wake_word = config.get('wake_word', self.wake_word)
                 self.model = config.get('model', 'gpt-3.5-turbo')
                 self.language = config.get('language', 'en')
-        except FileNotFoundError:
-            logger.warning("Config file not found. Using default settings.")
+                self.max_tokens = config.get('max_tokens', 150)
+                self.temperature = config.get('temperature', 0.7)
         except json.JSONDecodeError:
             logger.error("Error parsing config file. Using default settings.")
 
-    def get_response(self, user_input):
+    async def get_response(self, user_input):
+        """ Get response from OpenAI API asynchronously. """
         self.conversation_history.append({"role": "user", "content": user_input})
         messages = [
             {"role": "system", "content": "You are a helpful AI call center agent. Provide concise and accurate responses to customer queries."},
         ] + self.conversation_history
 
         try:
-            response = openai.ChatCompletion.create(
-                model=self.model,
-                messages=messages
-            )
-            ai_response = response.choices[0].message['content']
-            self.conversation_history.append({"role": "assistant", "content": ai_response})
-            return ai_response
+            async with self.session.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {openai.api_key}"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                }
+            ) as response:
+                result = await response.json()
+                ai_response = result['choices'][0]['message']['content']
+                self.conversation_history.append({"role": "assistant", "content": ai_response})
+                return ai_response
         except Exception as e:
             logger.error(f"Error in getting AI response: {e}")
             return "I'm sorry, I'm having trouble processing your request. Could you please try again?"
 
-    def handle_query(self, query):
+    async def handle_query(self, query):
+        """ Handle user queries based on keywords. """
         if "order status" in query.lower():
-            return self.check_order_status(query)
+            return await self.check_order_status(query)
         elif "return policy" in query.lower():
             return self.explain_return_policy()
         elif "end call" in query.lower():
             return self.end_call()
         else:
-            return self.get_response(query)
+            return await self.get_response(query)
 
-    def check_order_status(self, query):
-        # Placeholder for order status check
-        # In a real implementation, this would query a database or API
+    async def check_order_status(self, query):
+        """ Check order status asynchronously. """
+        # Simulating an API call to an order management system
+        await asyncio.sleep(1)  # Simulating network delay
         return "I've checked your order status. Your order #12345 is currently in transit and expected to arrive on Friday."
 
     def explain_return_policy(self):
+        """ Provide return policy information. """
         return "Our return policy allows you to return any item within 30 days of purchase for a full refund, provided the item is in its original condition."
 
     def end_call(self):
+        """ End the call and offer further assistance. """
         return "Thank you for calling. Is there anything else I can help you with before we end the call?"
 
-    def transcribe_audio(self, audio_file):
+    async def transcribe_audio(self, audio_file):
+        """ Transcribe audio file using OpenAI's Whisper model asynchronously. """
         try:
-            with open(audio_file, "rb") as file:
-                transcript = openai.Audio.transcribe("whisper-1", file)
-            return transcript["text"]
+            async with self.session.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai.api_key}"},
+                data={"model": "whisper-1"},
+                files={"file": audio_file}
+            ) as response:
+                result = await response.json()
+                return result.get("text")
         except Exception as e:
             logger.error(f"Error in transcribing audio: {e}")
             return None
 
     def text_to_speech(self, text):
+        """ Convert text to speech and play it. """
         try:
             tts = gTTS(text=text, lang=self.language)
-            tts.save("response.mp3")
-            pygame.mixer.music.load("response.mp3")
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            os.remove("response.mp3")
+            with io.BytesIO() as audio_file:
+                tts.write_to_fp(audio_file)
+                audio_file.seek(0)
+                pygame.mixer.music.load(audio_file)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10)
         except Exception as e:
             logger.error(f"Error in text-to-speech: {e}")
 
-    def listen_for_wake_word(self):
+    async def listen_for_wake_word(self):
+        """ Continuously listen for the wake word. """
         logger.info(f"Listening for wake word: '{self.wake_word}'")
         while True:
             try:
@@ -121,9 +151,11 @@ class AICallCenterAgent:
                 pass
             except Exception as e:
                 logger.error(f"Error in wake word detection: {e}")
+            await asyncio.sleep(0.1)  # Prevent blocking the event loop
 
-    def listen_and_respond(self):
-        if not self.listen_for_wake_word():
+    async def listen_and_respond(self):
+        """ Listen for a query and respond accordingly. """
+        if not await self.listen_for_wake_word():
             return
 
         self.call_start_time = time.time()
@@ -143,34 +175,33 @@ class AICallCenterAgent:
                 wav_writer.close()
 
                 wav_file.seek(0)
-                with open("temp_audio.wav", "wb") as f:
-                    f.write(wav_file.read())
-
-            transcription = self.transcribe_audio("temp_audio.wav")
-            if transcription:
-                logger.info(f"User said: {transcription}")
-                response = self.handle_query(transcription)
-                logger.info(f"Agent: {response}")
-                self.text_to_speech(response)
-            else:
-                logger.warning("Failed to transcribe audio")
-                self.text_to_speech("Sorry, I couldn't understand that. Could you please try again?")
+                transcription = await self.transcribe_audio(wav_file)
+                if transcription:
+                    logger.info(f"User said: {transcription}")
+                    response = await self.handle_query(transcription)
+                    logger.info(f"Agent: {response}")
+                    self.text_to_speech(response)
+                else:
+                    logger.warning("Failed to transcribe audio")
+                    self.text_to_speech("Sorry, I couldn't understand that. Could you please try again?")
 
         except sr.WaitTimeoutError:
             logger.warning("Listening timed out. Please try again.")
         except Exception as e:
             logger.error(f"An error occurred: {e}")
         finally:
-            if os.path.exists("temp_audio.wav"):
-                os.remove("temp_audio.wav")
             self.call_duration += time.time() - self.call_start_time
 
-    def run(self):
+    async def run(self):
+        """ Start the agent and listen for the wake word in a loop. """
         logger.info("AI Call Center Agent is running. Say the wake word to start.")
-        while True:
-            self.listen_and_respond()
+        async with aiohttp.ClientSession() as session:
+            self.session = session
+            while True:
+                await self.listen_and_respond()
 
     def generate_report(self):
+        """ Generate a report summarizing the agent's activity. """
         total_messages = len(self.conversation_history)
         user_messages = sum(1 for msg in self.conversation_history if msg["role"] == "user")
         ai_messages = sum(1 for msg in self.conversation_history if msg["role"] == "assistant")
@@ -186,10 +217,11 @@ class AICallCenterAgent:
         """
         return report
 
-def main():
+async def main():
+    """ Main function to run the agent asynchronously. """
     agent = AICallCenterAgent()
     try:
-        agent.run()
+        await agent.run()
     except KeyboardInterrupt:
         logger.info("\nGenerating report...")
         report = agent.generate_report()
@@ -197,4 +229,4 @@ def main():
         logger.info("AI Call Center Agent shutting down. Goodbye!")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
