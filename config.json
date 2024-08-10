@@ -1,0 +1,5 @@
+{
+  "wake_word": "hey agent",
+  "model": "gpt-3.5-turbo",
+  "language": "en"
+}
