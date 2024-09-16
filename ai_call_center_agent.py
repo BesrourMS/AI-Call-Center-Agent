@@ -14,6 +14,9 @@ from threading import Thread
 from queue import Queue
 import asyncio
 import aiohttp
+from speech_recognition import UnknownValueError, RequestError
+import pvporcupine
+import azure.cognitiveservices.speech as speechsdk
 
 # Load environment variables
 load_dotenv()
@@ -36,6 +39,10 @@ class AICallCenterAgent:
         pygame.mixer.init()
         self.load_config()
         self.session = None
+        self.porcupine = None
+        self.init_porcupine()
+        self.speech_config = speechsdk.SpeechConfig(subscription=os.getenv('AZURE_SPEECH_KEY'), region=os.getenv('AZURE_SPEECH_REGION'))
+        self.speech_config.speech_synthesis_voice_name = "en-US-JennyNeural"
 
     def load_config(self):
         """ Load configuration settings. """
@@ -55,13 +62,13 @@ class AICallCenterAgent:
         except json.JSONDecodeError:
             logger.error("Error parsing config file. Using default settings.")
 
+    def init_porcupine(self):
+        try:
+            self.porcupine = pvporcupine.create(keywords=["hey agent"])
+        except pvporcupine.PorcupineError as e:
+            logger.error(f"Failed to initialize Porcupine: {e}")
+            
     async def get_response(self, user_input):
-        """ Get response from OpenAI API asynchronously. """
-        self.conversation_history.append({"role": "user", "content": user_input})
-        messages = [
-            {"role": "system", "content": "You are a helpful AI call center agent. Provide concise and accurate responses to customer queries."},
-        ] + self.conversation_history
-
         try:
             async with self.session.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -73,13 +80,23 @@ class AICallCenterAgent:
                     "temperature": self.temperature,
                 }
             ) as response:
+                response.raise_for_status()
                 result = await response.json()
                 ai_response = result['choices'][0]['message']['content']
                 self.conversation_history.append({"role": "assistant", "content": ai_response})
                 return ai_response
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error in getting AI response: {e}")
+            return "I'm sorry, I'm having trouble connecting to my knowledge base. Could you please try again in a moment?"
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing AI response: {e}")
+            return "I received an unexpected response. Let me try to rephrase that for you."
+        except KeyError as e:
+            logger.error(f"Unexpected response structure: {e}")
+            return "I'm having trouble understanding my own response. Could you please rephrase your question?"
         except Exception as e:
-            logger.error(f"Error in getting AI response: {e}")
-            return "I'm sorry, I'm having trouble processing your request. Could you please try again?"
+            logger.error(f"Unexpected error in getting AI response: {e}")
+            return "I'm experiencing an unexpected issue. Please try again or contact support if this persists."
 
     async def handle_query(self, query):
         """ Handle user queries based on keywords. """
@@ -91,7 +108,36 @@ class AICallCenterAgent:
             return self.end_call()
         else:
             return await self.get_response(query)
+            
+    async def listen_for_wake_word(self):
+        if not self.porcupine:
+            logger.error("Porcupine not initialized. Falling back to default method.")
+            return await self.default_listen_for_wake_word()
 
+        pa = pyaudio.PyAudio()
+        audio_stream = pa.open(
+            rate=self.porcupine.sample_rate,
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=self.porcupine.frame_length)
+
+        try:
+            while True:
+                pcm = audio_stream.read(self.porcupine.frame_length)
+                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
+
+                keyword_index = self.porcupine.process(pcm)
+                if keyword_index >= 0:
+                    logger.info("Wake word detected!")
+                    return True
+        except Exception as e:
+            logger.error(f"Error in Porcupine wake word detection: {e}")
+            return False
+        finally:
+            audio_stream.close()
+            pa.terminate()
+            
     async def check_order_status(self, query):
         """ Check order status asynchronously. """
         # Simulating an API call to an order management system
@@ -121,20 +167,21 @@ class AICallCenterAgent:
             logger.error(f"Error in transcribing audio: {e}")
             return None
 
-    def text_to_speech(self, text):
-        """ Convert text to speech and play it. """
+    async def text_to_speech(self, text):
         try:
-            tts = gTTS(text=text, lang=self.language)
-            with io.BytesIO() as audio_file:
-                tts.write_to_fp(audio_file)
-                audio_file.seek(0)
-                pygame.mixer.music.load(audio_file)
-                pygame.mixer.music.play()
-                while pygame.mixer.music.get_busy():
-                    pygame.time.Clock().tick(10)
+            speech_synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config, audio_config=None)
+            result = speech_synthesizer.speak_text_async(text).get()
+
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                audio_data = result.audio_data
+                # Play audio_data using an appropriate audio library
+                # This could be done using pyaudio or another lightweight audio library
+            else:
+                logger.error(f"Speech synthesis failed: {result.reason}")
+                
         except Exception as e:
             logger.error(f"Error in text-to-speech: {e}")
-
+            
     async def listen_for_wake_word(self):
         """ Continuously listen for the wake word. """
         logger.info(f"Listening for wake word: '{self.wake_word}'")
