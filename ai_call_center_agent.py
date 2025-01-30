@@ -17,6 +17,8 @@ import aiohttp
 from speech_recognition import UnknownValueError, RequestError
 import pvporcupine
 import azure.cognitiveservices.speech as speechsdk
+import pyaudio
+import struct
 
 # Load environment variables
 load_dotenv()
@@ -64,11 +66,22 @@ class AICallCenterAgent:
 
     def init_porcupine(self):
         try:
-            self.porcupine = pvporcupine.create(keywords=["hey agent"])
-        except pvporcupine.PorcupineError as e:
+            access_key = os.getenv('PORCUPINE_ACCESS_KEY')
+            if not access_key:
+                raise ValueError("Porcupine access key not found in environment variables")
+            self.porcupine = pvporcupine.create(
+                access_key=access_key,
+                keywords=["hey agent"]
+            )
+        except Exception as e:
             logger.error(f"Failed to initialize Porcupine: {e}")
+            self.porcupine = None
             
     async def get_response(self, user_input):
+        self.conversation_history.append({"role": "user", "content": user_input})
+        messages = [{"role": "system", "content": "You are a helpful call center assistant."}]
+        messages.extend(self.conversation_history[-5:])  # Keep last 5 messages for context
+
         try:
             async with self.session.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -153,36 +166,45 @@ class AICallCenterAgent:
         return "Thank you for calling. Is there anything else I can help you with before we end the call?"
 
     async def transcribe_audio(self, audio_file):
-        """ Transcribe audio file using OpenAI's Whisper model asynchronously. """
         try:
+            data = aiohttp.FormData()
+            data.add_field('file', audio_file, filename='audio.wav', content_type='audio/wav')
+            data.add_field('model', 'whisper-1')
+
             async with self.session.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {openai.api_key}"},
-                data={"model": "whisper-1"},
-                files={"file": audio_file}
+                data=data
             ) as response:
+                response.raise_for_status()
                 result = await response.json()
-                return result.get("text")
+                return result.get("text", "")
         except Exception as e:
             logger.error(f"Error in transcribing audio: {e}")
             return None
 
     async def text_to_speech(self, text):
         try:
-            speech_synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config, audio_config=None)
-            result = speech_synthesizer.speak_text_async(text).get()
-
+            speech_synthesizer = speechsdk.SpeechSynthesizer(speech_config=self.speech_config)
+            result = await asyncio.to_thread(speech_synthesizer.speak_text, text)
+            
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                 audio_data = result.audio_data
-                # Play audio_data using an appropriate audio library
-                # This could be done using pyaudio or another lightweight audio library
+                p = pyaudio.PyAudio()
+                stream = p.open(format=pyaudio.paInt16,
+                                channels=1,
+                                rate=24000,
+                                output=True)
+                await asyncio.to_thread(stream.write, audio_data)
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
             else:
                 logger.error(f"Speech synthesis failed: {result.reason}")
-                
         except Exception as e:
             logger.error(f"Error in text-to-speech: {e}")
             
-    async def listen_for_wake_word(self):
+    async def default_listen_for_wake_word(self):
         """ Continuously listen for the wake word. """
         logger.info(f"Listening for wake word: '{self.wake_word}'")
         while True:
@@ -211,7 +233,7 @@ class AICallCenterAgent:
         try:
             with sr.Microphone() as source:
                 self.recognizer.adjust_for_ambient_noise(source)
-                audio = self.recognizer.listen(source, timeout=10)
+                audio = await asyncio.to_thread(self.recognizer.listen, source, timeout=10)
 
             with io.BytesIO() as wav_file:
                 wav_writer = wave.open(wav_file, "wb")
@@ -263,6 +285,16 @@ class AICallCenterAgent:
         AI Responses: {ai_messages}
         """
         return report
+    
+    def __del__(self):
+        if self.porcupine:
+            self.porcupine.delete()
+
+    def add_to_history(self, role, content):
+        self.conversation_history.append({"role": role, "content": content})
+        # Keep only last 6 exchanges (3 user + 3 assistant)
+        if len(self.conversation_history) > 6:
+            self.conversation_history = self.conversation_history[-6:]
 
 async def main():
     """ Main function to run the agent asynchronously. """
